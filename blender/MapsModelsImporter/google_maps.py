@@ -24,6 +24,7 @@
 import sys
 import os
 import subprocess
+import math
 import numpy as np
 
 from .profiling import Timer, profiling_counters
@@ -110,8 +111,7 @@ import bmesh
 import pickle
 from bpy_extras import object_utils
 from math import floor, pi
-from mathutils import Matrix
-import os
+from mathutils import Matrix, Vector
 
 def makeMatrix(mdata):
     return Matrix([
@@ -229,6 +229,85 @@ def numpyLoad(file):
     array = array.reshape(shape)
     return array
 
+
+def compute_atlas_layout(tiles):
+    """Place tiles on a simple grid, returning atlas size and tile layout."""
+    if not tiles:
+        return 0, 0, []
+
+    valid_widths = [t["width"] for t in tiles if t["width"]]
+    valid_heights = [t["height"] for t in tiles if t["height"]]
+    cell_w = max(valid_widths) if valid_widths else 1
+    cell_h = max(valid_heights) if valid_heights else 1
+
+    cols = math.ceil(math.sqrt(len(tiles)))
+    rows = math.ceil(len(tiles) / cols)
+    atlas_w = cols * cell_w
+    atlas_h = rows * cell_h
+
+    layout = []
+    for idx, tile in enumerate(tiles):
+        col = idx % cols
+        row = idx // cols
+        layout.append({
+            **tile,
+            "x": col * cell_w,
+            "y": row * cell_h,
+            "cell_w": cell_w,
+            "cell_h": cell_h,
+        })
+    return atlas_w, atlas_h, layout
+
+
+def build_atlas_image(layout, atlas_w, atlas_h, name="GoogleMapsAtlas"):
+    """Create a new Blender image by copying all tiles into an atlas."""
+    if atlas_w == 0 or atlas_h == 0:
+        return None
+
+    atlas_img = bpy.data.images.new(name=name, width=atlas_w, height=atlas_h, alpha=True, float_buffer=False)
+
+    pixels = np.zeros((atlas_h, atlas_w, 4), dtype=np.float32)
+    for tile in layout:
+        img = tile["img"]
+        if img is None:
+            continue
+        w, h = tile["width"], tile["height"]
+        if w is None or h is None:
+            continue
+        src = np.array(img.pixels[:], dtype=np.float32)
+        try:
+            src = src.reshape((h, w, 4))
+        except ValueError:
+            continue
+        y0, y1 = tile["y"], tile["y"] + h
+        x0, x1 = tile["x"], tile["x"] + w
+        pixels[y0:y1, x0:x1, :] = src
+
+    atlas_img.pixels = pixels.reshape(-1).tolist()
+    atlas_img.update()
+    return atlas_img
+
+
+def remap_uvs_to_atlas(uvs, tile, atlas_w, atlas_h):
+    """Remap a UV island into its atlas position."""
+    if atlas_w == 0 or atlas_h == 0 or tile["width"] in (None, 0) or tile["height"] in (None, 0):
+        return uvs
+    if len(uvs) == 0:
+        return uvs
+
+    remapped = np.array(uvs, dtype=np.float64)
+    max_u = remapped[:,0].max()
+    max_v = remapped[:,1].max()
+    min_u = remapped[:,0].min()
+    min_v = remapped[:,1].min()
+    if max_u > 1.001 or max_v > 1.001 or min_u < -0.001 or min_v < -0.001:
+        remapped[:,0] /= float(tile["width"])
+        remapped[:,1] /= float(tile["height"])
+
+    remapped[:,0] = remapped[:,0] * (tile["width"] / atlas_w) + tile["x"] / atlas_w
+    remapped[:,1] = remapped[:,1] * (tile["height"] / atlas_h) + tile["y"] / atlas_h
+    return remapped
+
 def loadData(prefix, drawcall_id):
     with open("{}{:05d}-indices.bin".format(prefix, drawcall_id), 'rb') as file:
         #indices = pickle.load(file)
@@ -259,6 +338,10 @@ def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, glob
     """Import data from the files extracted by captureToFiles"""
     # Get reference matrix
     refMatrix = None
+    all_verts = []
+    all_tris = []
+    all_uvs = []
+    tiles = []
     
     if max_blocks <= 0:
         # If no specific bound, max block is the number of .bin files in the directory
@@ -339,17 +422,49 @@ def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, glob
 
         profiling_counters["processData"].add_sample(timer)
 
+        transform = matrix.copy()
+        transform *= globalScale
 
-        mesh_name = "BuildingMesh-{:05d}".format(drawcall_id)
-        timer = Timer()
-        obj = addMesh(context, mesh_name, verts, tris, uvs)
-        profiling_counters["addMesh"].add_sample(timer)
-        obj.matrix_world = matrix * globalScale
+        start_idx = len(all_verts)
+        transformed_verts = []
+        for v in verts:
+            vec = transform @ Vector((float(v[0]), float(v[1]), float(v[2]), 1.0))
+            transformed_verts.append([vec.x, vec.y, vec.z])
+        all_verts.extend(transformed_verts)
+        all_uvs.extend([[float(u[0]), float(u[1])] for u in uvs])
+        all_tris.extend([[int(t[0]) + start_idx, int(t[1]) + start_idx, int(t[2]) + start_idx] for t in tris])
 
-        mat_name = "BuildingMat-{:05d}".format(drawcall_id)
-        addImageMaterial(mat_name, obj, img)
+        width = img.size[0] if img else None
+        height = img.size[1] if img else None
+        tiles.append({
+            "start": start_idx,
+            "end": len(all_verts),
+            "img": img,
+            "width": width,
+            "height": height,
+        })
 
         drawcall_id += 1
+
+    if not all_verts:
+        return None
+
+    atlas_w, atlas_h, layout = compute_atlas_layout(tiles)
+    for tile in layout:
+        start = tile["start"]
+        end = tile["end"]
+        remapped = remap_uvs_to_atlas(all_uvs[start:end], tile, atlas_w, atlas_h)
+        for idx, uv in enumerate(remapped):
+            all_uvs[start + idx] = [float(uv[0]), float(uv[1])]
+
+    atlas_img = build_atlas_image(layout, atlas_w, atlas_h, name="GoogleMapsAtlas")
+
+    mesh_name = "GoogleMapsMesh"
+    timer = Timer()
+    obj = addMesh(context, mesh_name, all_verts, all_tris, np.array(all_uvs))
+    profiling_counters["addMesh"].add_sample(timer)
+
+    addImageMaterial("GoogleMapsAtlasMat", obj, atlas_img)
 
     # Save reference matrix
     if refMatrix:
